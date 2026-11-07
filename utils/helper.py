@@ -30,6 +30,7 @@ MAX_JSON_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_JSON_EDIT_IMAGES = 10
 DATA_URL_IMAGE_RE = re.compile(r"^data:(?P<mime>[-+./\w]+);base64,(?P<data>.*)$", re.DOTALL)
 REMOTE_IMAGE_TIMEOUT_SECONDS = 20
+MAX_IMAGE_COUNT = 10
 
 
 def _image_extension(mime_type: str) -> str:
@@ -452,8 +453,8 @@ def parse_image_count(raw_value: object) -> int:
         value = int(raw_value or 1)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail={"error": "n must be an integer"}) from exc
-    if value < 1 or value > 4:
-        raise HTTPException(status_code=400, detail={"error": "n must be between 1 and 4"})
+    if value < 1 or value > MAX_IMAGE_COUNT:
+        raise HTTPException(status_code=400, detail={"error": f"n must be between 1 and {MAX_IMAGE_COUNT}"})
     return value
 
 
