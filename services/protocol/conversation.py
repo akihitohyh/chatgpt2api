@@ -145,6 +145,76 @@ def is_model_text_reply_instead_of_image(message: str) -> bool:
     return False
 
 
+IMAGE_TEXT_REPLY_RATE_LIMITED = "rate_limited"
+IMAGE_TEXT_REPLY_NO_IMAGE_TOOL = "no_image_tool"
+# 号没调起画图工具时，先歇一会再给它派图，避免同一个号连续把请求“说没”
+IMAGE_NO_TOOL_COOLDOWN_SECS = 10 * 60
+# 文字里说“等约 N 小时”就按 N 小时冷却，没写就默认 1 小时
+IMAGE_RATE_LIMIT_DEFAULT_COOLDOWN_SECS = 60 * 60
+IMAGE_RATE_LIMIT_MAX_COOLDOWN_SECS = 24 * 60 * 60
+
+# 内容审核类拒绝：换号也没用，不重试
+_IMAGE_POLICY_REFUSAL_RE = re.compile(r"违反|内容政策|防护限制|content policy|safety system", re.IGNORECASE)
+# 账号层面的频率限制 / 套餐上限：换号能解决
+_IMAGE_RATE_LIMIT_RE = re.compile(
+    r"频率限制|速率限制|生成上限|请求上限|"
+    r"rate limit|too many (?:image )?requests|image generation limit|usage limit",
+    re.IGNORECASE,
+)
+# 号没调起画图工具，只回了一段文字（常见是“无法直接生成图片，可以帮你整理提示词”）
+_IMAGE_NO_TOOL_RE = re.compile(
+    r"无法[^。\n]{0,12}直接[^。\n]{0,12}生成[^。\n]{0,6}(?:图片|图像|视频)|"
+    r"未能调用图像生成工具|"
+    r"(?:整理|完善|优化|改写)[^。\n]{0,20}提示词|"
+    r"(?:can't|cannot|can not|unable to) (?:directly )?(?:generate|create) (?:images?|an image|pictures?)",
+    re.IGNORECASE,
+)
+_COOLDOWN_HOURS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:个)?\s*(?:小时|hours?)", re.IGNORECASE)
+
+
+def classify_image_text_reply(message: str) -> str:
+    """判断生图时上游回的文字是不是“换个号就能成功”的那种。
+
+    返回 IMAGE_TEXT_REPLY_RATE_LIMITED / IMAGE_TEXT_REPLY_NO_IMAGE_TOOL，
+    内容审核拒绝或无法判断时返回空字符串（保持原来的直接报错）。
+    """
+    text = str(message or "")
+    if not text or _IMAGE_POLICY_REFUSAL_RE.search(text):
+        return ""
+    if _IMAGE_RATE_LIMIT_RE.search(text):
+        return IMAGE_TEXT_REPLY_RATE_LIMITED
+    if _IMAGE_NO_TOOL_RE.search(text):
+        return IMAGE_TEXT_REPLY_NO_IMAGE_TOOL
+    return ""
+
+
+def image_text_reply_cooldown_secs(kind: str, message: str) -> int:
+    if kind == IMAGE_TEXT_REPLY_NO_IMAGE_TOOL:
+        return IMAGE_NO_TOOL_COOLDOWN_SECS
+    if kind != IMAGE_TEXT_REPLY_RATE_LIMITED:
+        return 0
+    text = str(message or "")
+    match = _COOLDOWN_HOURS_RE.search(text)
+    if match:
+        seconds = int(float(match.group(1)) * 3600)
+    elif "一小时" in text or "一个小时" in text:
+        seconds = 3600
+    else:
+        seconds = IMAGE_RATE_LIMIT_DEFAULT_COOLDOWN_SECS
+    return max(60, min(seconds, IMAGE_RATE_LIMIT_MAX_COOLDOWN_SECS))
+
+
+class _SwitchAccountTextReply(Exception):
+    """内部信号：这个号回了“换号能解决”的文字，换下一个号重试。"""
+
+    def __init__(self, kind: str, text: str, conversation_id: str = "", output: Any = None) -> None:
+        super().__init__(text)
+        self.kind = kind
+        self.text = text
+        self.conversation_id = conversation_id
+        self.output = output
+
+
 def encode_images(images: Iterable[tuple[bytes, str, str]]) -> list[str]:
     return [base64.b64encode(data).decode("ascii") for data, _, _ in images if data]
 
@@ -1316,11 +1386,14 @@ def _generate_single_image(
     MAX_CONN_TIMEOUT_RETRIES = 3
     # 轮询超时错误最大重试次数（换账号重试）
     MAX_POLL_TIMEOUT_RETRIES = 4
+    # 号被限频 / 没调起画图工具时最多换几次号（不含第一次）
+    MAX_SWITCH_ACCOUNT_RETRIES = 3
 
     text_reply_retry_count = 0
     tls_retry_count = 0
     conn_timeout_retry_count = 0
     poll_timeout_retry_count = 0
+    switch_account_retry_count = 0
     account_email = ""
 
     while True:
@@ -1362,6 +1435,10 @@ def _generate_single_image(
                     last_conversation_id = output.conversation_id or last_conversation_id
                     if account_email and not output.account_email:
                         output.account_email = account_email
+                    if output.kind == "message":
+                        switch_kind = classify_image_text_reply(output.text)
+                        if switch_kind:
+                            raise _SwitchAccountTextReply(switch_kind, output.text or "", output.conversation_id, output)
                     if output.kind == "message" and request.message_as_error:
                         raise ImageGenerationError(
                             output.text or "Image generation was rejected by upstream policy.",
@@ -1425,8 +1502,60 @@ def _generate_single_image(
                 })
                 raise
             raise
+        except _SwitchAccountTextReply as exc:
+            account_service.mark_image_result(token, False)
+            cooldown_secs = image_text_reply_cooldown_secs(exc.kind, exc.text)
+            account_service.cool_down_image_account(token, cooldown_secs, reason=exc.kind)
+            switch_account_retry_count += 1
+            if switch_account_retry_count <= MAX_SWITCH_ACCOUNT_RETRIES:
+                logger.warning({
+                    "event": "image_text_reply_switch_account",
+                    "reason": exc.kind,
+                    "request_token": token,
+                    "account_email": account_email,
+                    "cooldown_secs": cooldown_secs,
+                    "retry_count": switch_account_retry_count,
+                    "index": index,
+                    "error": exc.text[:200],
+                })
+                continue
+            logger.warning({
+                "event": "image_text_reply_switch_account_exhausted",
+                "reason": exc.kind,
+                "request_token": token,
+                "account_email": account_email,
+                "retry_count": switch_account_retry_count,
+                "index": index,
+            })
+            # 换号次数用完：和改动前一样把这段文字交回去
+            if request.message_as_error:
+                raise ImageGenerationError(
+                    exc.text or "Image generation was rejected by upstream policy.",
+                    status_code=400,
+                    error_type="invalid_request_error",
+                    code="content_policy_violation",
+                    account_email=account_email,
+                    conversation_id=exc.conversation_id,
+                ) from exc
+            return [exc.output] if exc.output is not None else []
         except ImageContentPolicyError as exc:
             account_service.mark_image_result(token, False)
+            switch_kind = classify_image_text_reply(str(exc))
+            if switch_kind and switch_account_retry_count < MAX_SWITCH_ACCOUNT_RETRIES:
+                switch_account_retry_count += 1
+                cooldown_secs = image_text_reply_cooldown_secs(switch_kind, str(exc))
+                account_service.cool_down_image_account(token, cooldown_secs, reason=switch_kind)
+                logger.warning({
+                    "event": "image_text_reply_switch_account",
+                    "reason": switch_kind,
+                    "request_token": token,
+                    "account_email": account_email,
+                    "cooldown_secs": cooldown_secs,
+                    "retry_count": switch_account_retry_count,
+                    "index": index,
+                    "error": str(exc)[:200],
+                })
+                continue
             logger.warning({
                 "event": "image_stream_content_policy_error",
                 "request_token": token,

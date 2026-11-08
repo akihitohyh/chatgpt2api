@@ -54,6 +54,8 @@ class AccountService:
         self._index = 0
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
+        # 生图临时冷却（只在内存里）：号回了“限频 / 没调起画图工具”后，到期前不再给它派图
+        self._image_cooldown_until: dict[str, float] = {}
         self._token_aliases: dict[str, str] = {}
         self._cumulative_total = self._load_cumulative_total()
 
@@ -894,6 +896,7 @@ class AccountService:
             plan_types: set[str] | tuple[str, ...] | None = None,
     ) -> list[str]:
         excluded = set(excluded_tokens or set())
+        now = time.time()
         return [
             token
             for item in self._accounts.values()
@@ -903,7 +906,38 @@ class AccountService:
                and self._account_matches_source_type(item, source_type)
                and (token := item.get("access_token") or "")
                and token not in excluded
+               and not self._is_image_cooling_down_locked(token, now)
         ]
+
+    def _is_image_cooling_down_locked(self, access_token: str, now: float) -> bool:
+        until = self._image_cooldown_until.get(access_token)
+        if until is None:
+            return False
+        if until <= now:
+            self._image_cooldown_until.pop(access_token, None)
+            return False
+        return True
+
+    def cool_down_image_account(self, access_token: str, seconds: float, reason: str = "") -> None:
+        """让这个号暂时不接生图请求（只在内存里，重启即清空）。"""
+        if not access_token or seconds <= 0:
+            return
+        with self._image_slot_condition:
+            access_token = self._resolve_access_token_locked(access_token)
+            until = time.time() + float(seconds)
+            self._image_cooldown_until[access_token] = max(until, self._image_cooldown_until.get(access_token, 0.0))
+            self._image_slot_condition.notify_all()
+        log_service.add(
+            LOG_TYPE_ACCOUNT,
+            "生图临时冷却账号",
+            {"token": anonymize_token(access_token), "reason": reason, "seconds": int(seconds)},
+        )
+
+    def image_cooldown_remaining(self, access_token: str) -> float:
+        with self._lock:
+            access_token = self._resolve_access_token_locked(access_token)
+            until = self._image_cooldown_until.get(access_token, 0.0)
+        return max(0.0, until - time.time())
 
     def _list_available_candidate_tokens(
             self,
