@@ -169,6 +169,7 @@ _IMAGE_NO_TOOL_RE = re.compile(
     r"(?:can't|cannot|can not|unable to) (?:directly )?(?:generate|create) (?:images?|an image|pictures?)",
     re.IGNORECASE,
 )
+IMAGE_TOOL_NOT_INVOKED_MESSAGE = "upstream account did not invoke the image generation tool"
 _COOLDOWN_HOURS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:个)?\s*(?:小时|hours?)", re.IGNORECASE)
 
 
@@ -987,6 +988,38 @@ def stream_image_outputs(
             "message_preview": message[:200],
         })
 
+    # 上游明确说这一轮没调起画图工具（tool_invoked=False，且不是 image gen 回合），
+    # 也没有任何文件 ID：后面不会再有图了，轮询只会白等到超时，直接换号。
+    # 常见于带参考图的请求：号把它当普通对话回了，或者什么都没回。
+    if (
+        last.get("tool_invoked") is False
+        and last.get("turn_use_case") != "image gen"
+        and not file_ids
+        and not sediment_ids
+        and not is_text_reply
+    ):
+        logger.warning({
+            "event": "image_tool_not_invoked_skip_poll",
+            "conversation_id": conversation_id,
+            "turn_use_case": last.get("turn_use_case"),
+            "has_reference_images": bool(request.images),
+            "message_preview": message[:200],
+        })
+        output = (
+            ImageOutput(kind="message", model=request.model, index=index, total=total, text=message, conversation_id=conversation_id)
+            if message else None
+        )
+        if output is not None and _IMAGE_POLICY_REFUSAL_RE.search(message):
+            # 内容审核拒绝：换号也没用，直接把拒绝文字交回去
+            yield output
+            return
+        raise _SwitchAccountTextReply(
+            classify_image_text_reply(message) or IMAGE_TEXT_REPLY_NO_IMAGE_TOOL,
+            message or IMAGE_TOOL_NOT_INVOKED_MESSAGE,
+            conversation_id,
+            output,
+        )
+
     # 当检测到文本回复但 conversation_id 丢失时，尝试从最近对话列表中恢复
     # SSE 流太短时（模型返回文本而非触发图片工具），conversation_id 可能未被捕获，
     # 但图片已在上游异步生成。通过列出最近对话来恢复 conversation_id。
@@ -1527,6 +1560,17 @@ def _generate_single_image(
                 "retry_count": switch_account_retry_count,
                 "index": index,
             })
+            # 换号次数用完：没有文字可交回时，按“上游没出图”报错
+            if exc.output is None:
+                raise ImageGenerationError(
+                    "Image generation failed: the upstream account did not invoke the image generation tool. "
+                    "Please try again later.",
+                    status_code=502,
+                    error_type="server_error",
+                    code="no_image_generated",
+                    account_email=account_email,
+                    conversation_id=exc.conversation_id,
+                ) from exc
             # 换号次数用完：和改动前一样把这段文字交回去
             if request.message_as_error:
                 raise ImageGenerationError(
