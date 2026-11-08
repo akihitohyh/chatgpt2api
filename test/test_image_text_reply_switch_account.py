@@ -17,8 +17,11 @@ from services.protocol.conversation import (
     ConversationRequest,
     ImageGenerationError,
     ImageOutput,
+    IMAGE_TOOL_NOT_INVOKED_MESSAGE,
     _generate_single_image,
+    _SwitchAccountTextReply,
     classify_image_text_reply,
+    stream_image_outputs,
     image_text_reply_cooldown_secs,
 )
 from services.storage.json_storage import JSONStorageBackend
@@ -157,6 +160,92 @@ class SwitchAccountLoopTests(unittest.TestCase):
         self.assertIsInstance(exc, ImageGenerationError)
         self.assertEqual(str(exc), POLICY_REPLIES[0])
         self.assertEqual(accounts.cooldowns, [])
+
+
+class ReachedPolling(Exception):
+    pass
+
+
+class PollingBackend:
+    def __init__(self) -> None:
+        self.polled = False
+
+    def resolve_conversation_image_urls(self, *args, **kwargs):
+        self.polled = True
+        raise ReachedPolling()
+
+
+class ToolNotInvokedTests(unittest.TestCase):
+    """号明确没调起画图工具时，不再轮询等图（线上会白等 300 秒），直接换号。"""
+
+    def _stream(self, *, tool_invoked, turn_use_case="multimodal", text="", file_ids=None):
+        backend = PollingBackend()
+        final_event = {
+            "type": "conversation.done",
+            "conversation_id": "conv-1",
+            "text": text,
+            "file_ids": file_ids or [],
+            "sediment_ids": [],
+            "tool_invoked": tool_invoked,
+            "turn_use_case": turn_use_case,
+        }
+        request = ConversationRequest(model="gpt-image-2", prompt="改成蓝色", images=["data:image/png;base64,AAAA"])
+        with patch.object(conversation, "conversation_events", lambda *a, **k: iter([final_event])), \
+                patch.object(conversation, "_get_detailed_error_from_tasks", lambda *a, **k: ""):
+            outputs = list(stream_image_outputs(backend, request, 0, 1))
+        return backend, outputs
+
+    def test_tool_not_invoked_without_text_switches_account(self) -> None:
+        with self.assertRaises(_SwitchAccountTextReply) as ctx:
+            self._stream(tool_invoked=False, turn_use_case="multimodal")
+        self.assertEqual(ctx.exception.kind, IMAGE_TEXT_REPLY_NO_IMAGE_TOOL)
+        self.assertEqual(ctx.exception.text, IMAGE_TOOL_NOT_INVOKED_MESSAGE)
+        self.assertIsNone(ctx.exception.output)
+        self.assertEqual(ctx.exception.conversation_id, "conv-1")
+
+    def test_tool_not_invoked_with_text_reply_switches_and_keeps_text(self) -> None:
+        with self.assertRaises(_SwitchAccountTextReply) as ctx:
+            self._stream(tool_invoked=False, turn_use_case="text", text="这张图建议换成冷色调，下面是优化建议。")
+        self.assertEqual(ctx.exception.kind, IMAGE_TEXT_REPLY_NO_IMAGE_TOOL)
+        self.assertEqual(ctx.exception.output.text, "这张图建议换成冷色调，下面是优化建议。")
+
+    def test_tool_not_invoked_with_rate_limit_text_uses_rate_limit_kind(self) -> None:
+        with self.assertRaises(_SwitchAccountTextReply) as ctx:
+            self._stream(tool_invoked=False, turn_use_case="text", text=RATE_LIMIT_REPLIES[0][0])
+        self.assertEqual(ctx.exception.kind, IMAGE_TEXT_REPLY_RATE_LIMITED)
+
+    def test_tool_not_invoked_policy_refusal_is_returned_directly(self) -> None:
+        backend, outputs = self._stream(tool_invoked=False, turn_use_case="text", text=POLICY_REPLIES[1])
+        self.assertFalse(backend.polled)
+        self.assertEqual([(item.kind, item.text) for item in outputs], [("message", POLICY_REPLIES[1])])
+
+    def test_unknown_tool_state_still_polls(self) -> None:
+        with self.assertRaises(ReachedPolling):
+            self._stream(tool_invoked=None, turn_use_case="multimodal")
+
+    def test_image_gen_turn_still_polls(self) -> None:
+        with self.assertRaises(ReachedPolling):
+            self._stream(tool_invoked=False, turn_use_case="image gen")
+
+    def test_exhausted_without_text_returns_no_image_error(self) -> None:
+        accounts = FakeAccountService()
+        calls: list[int] = []
+
+        def fake_stream(_backend, request, index, total):
+            calls.append(1)
+            raise _SwitchAccountTextReply(IMAGE_TEXT_REPLY_NO_IMAGE_TOOL, IMAGE_TOOL_NOT_INVOKED_MESSAGE, "conv", None)
+            yield  # pragma: no cover
+
+        request = ConversationRequest(model="gpt-image-2", prompt="a cat", message_as_error=True)
+        with patch.object(conversation, "account_service", accounts), \
+                patch.object(conversation, "OpenAIBackendAPI", FakeBackend), \
+                patch.object(conversation, "stream_image_outputs", fake_stream), \
+                patch.object(conversation, "_remove_image_conversation_later", lambda *a, **k: None):
+            with self.assertRaises(ImageGenerationError) as ctx:
+                _generate_single_image(request, 0, 1)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertEqual(ctx.exception.code, "no_image_generated")
 
 
 class AccountImageCooldownTests(unittest.TestCase):
