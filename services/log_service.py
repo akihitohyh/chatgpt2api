@@ -15,6 +15,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from services.config import DATA_DIR
+from services.process_role import is_worker
 from services.protocol.error_response import anthropic_error_response, openai_error_response
 from utils.helper import anthropic_sse_stream, sse_json_stream
 
@@ -110,7 +111,13 @@ class LogService:
         return {"removed": removed}
 
 
-log_service = LogService(DATA_DIR / "logs.jsonl")
+if is_worker():
+    # 工作进程不直接写日志文件，几个进程同时追加大行会互相穿插
+    from services.coordinator import RemoteLogService
+
+    log_service = RemoteLogService()
+else:
+    log_service = LogService(DATA_DIR / "logs.jsonl")
 
 
 def _collect_urls(value: object) -> list[str]:

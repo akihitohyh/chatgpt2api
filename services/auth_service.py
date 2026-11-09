@@ -9,6 +9,7 @@ from threading import Lock
 from typing import Literal
 
 from services.config import config
+from services.process_role import is_worker
 from services.storage.base import StorageBackend
 
 AuthRole = Literal["admin", "user"]
@@ -250,4 +251,9 @@ class AuthService:
         return None
 
 
-auth_service = AuthService(config.get_storage_backend())
+if is_worker():
+    from services.coordinator import RemoteAuthService
+
+    auth_service = RemoteAuthService()
+else:
+    auth_service = AuthService(config.get_storage_backend())

@@ -18,6 +18,7 @@ from services.log_service import (
     LOG_TYPE_ACCOUNT,
     log_service,
 )
+from services.process_role import is_worker
 from services.storage.base import StorageBackend
 from utils.helper import anonymize_token
 
@@ -1791,8 +1792,14 @@ class AccountService:
         }
 
 
-account_service = AccountService(
-    config.get_storage_backend(),
-    save_interval_secs=config.account_save_interval_secs,
-)
-atexit.register(account_service.flush_pending_save)
+if is_worker():
+    # 工作进程不持有号池，所有调用交给管家进程
+    from services.coordinator import RemoteAccountService
+
+    account_service = RemoteAccountService()
+else:
+    account_service = AccountService(
+        config.get_storage_backend(),
+        save_interval_secs=config.account_save_interval_secs,
+    )
+    atexit.register(account_service.flush_pending_save)

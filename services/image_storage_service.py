@@ -7,7 +7,9 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from threading import Lock
+import os
+import threading
+from threading import Event, Lock, RLock, Thread
 from urllib.parse import quote, urlparse
 
 from curl_cffi import requests
@@ -15,9 +17,13 @@ from fastapi import HTTPException
 from PIL import Image
 
 from services.config import DATA_DIR, config
+from services.process_role import is_worker
 
 IMAGE_INDEX_FILE = DATA_DIR / "image_index.json"
-IMAGE_INDEX_LOCK = Lock()
+IMAGE_INDEX_LOCK = RLock()
+# 每存一张图都扫一遍图片目录太费 CPU；定时清理线程另有安排，这里最多 10 分钟扫一次
+_SAVE_CLEANUP_INTERVAL_SECS = 600.0
+_last_save_cleanup_at = 0.0
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 
 
@@ -165,9 +171,19 @@ class WebDAVClient:
 
 
 class ImageStorageService:
-    def __init__(self, index_file: Path = IMAGE_INDEX_FILE):
+    def __init__(self, index_file: Path = IMAGE_INDEX_FILE, save_interval_secs: float = 0.0):
         self.index_file = index_file
         self._index_lock = IMAGE_INDEX_LOCK
+        # 索引常驻内存，新图只记脏、后台合并写盘；以前每存一张图都要整份读写一遍几 MB 的索引文件
+        self._index_cache: dict[str, dict[str, object]] | None = None
+        self._index_dirty = False
+        self._save_interval_secs = max(0.0, float(save_interval_secs or 0.0))
+        self._flush_wakeup = Event()
+        self._flush_thread: Thread | None = None
+        # 写盘序号：只允许比已落盘更新的快照替换文件，防止慢的旧快照盖掉新的
+        self._snapshot_gen = 0
+        self._written_gen = 0
+        self._write_lock = Lock()
 
     def settings(self) -> dict[str, object]:
         return config.get_image_storage_settings()
@@ -182,12 +198,78 @@ class ImageStorageService:
             return {}
         return {str(key): value for key, value in items.items() if isinstance(value, dict)}
 
+    def _cached_index_locked(self) -> dict[str, dict[str, object]]:
+        if self._index_cache is None:
+            items = self._load_index()
+            self._index_cache = {rel: item for rel, item in items.items() if _is_image_rel(rel)}
+        return self._index_cache
+
     def _load_clean_index(self) -> dict[str, dict[str, object]]:
-        items = self._load_index()
-        return {rel: item for rel, item in items.items() if _is_image_rel(rel)}
+        with self._index_lock:
+            return dict(self._cached_index_locked())
+
+    def _snapshot_locked(self) -> tuple[int, dict[str, dict[str, object]]]:
+        self._snapshot_gen += 1
+        self._index_dirty = False
+        return self._snapshot_gen, dict(self._index_cache or {})
+
+    def _write_snapshot(self, gen: int, items: dict[str, dict[str, object]]) -> None:
+        path = self.index_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{gen}.tmp")
+        try:
+            tmp_path.write_text(json.dumps({"items": items}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            with self._write_lock:
+                if gen > self._written_gen:
+                    os.replace(tmp_path, path)
+                    self._written_gen = gen
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
 
     def _save_index(self, items: dict[str, dict[str, object]]) -> None:
-        _write_json_object(self.index_file, {"items": items})
+        with self._index_lock:
+            self._index_cache = {rel: item for rel, item in items.items() if _is_image_rel(rel)}
+            gen, snapshot = self._snapshot_locked()
+            self._write_snapshot(gen, snapshot)
+
+    def add_index_item(self, rel: str, item: dict[str, object]) -> None:
+        """登记一张新图。间隔 >0 时只记脏，由后台线程合并写盘。"""
+        if not _is_image_rel(rel):
+            return
+        with self._index_lock:
+            self._cached_index_locked()[rel] = dict(item)
+            if self._save_interval_secs <= 0:
+                gen, snapshot = self._snapshot_locked()
+                self._write_snapshot(gen, snapshot)
+                return
+            self._index_dirty = True
+            if self._flush_thread is None:
+                self._flush_thread = Thread(target=self._flush_loop, name="image-index-save", daemon=True)
+                self._flush_thread.start()
+        self._flush_wakeup.set()
+
+    def _flush_loop(self) -> None:
+        while True:
+            self._flush_wakeup.wait()
+            time.sleep(self._save_interval_secs)
+            self._flush_wakeup.clear()
+            self.flush_index()
+
+    def flush_index(self) -> bool:
+        with self._index_lock:
+            if not self._index_dirty or self._index_cache is None:
+                return False
+            gen, snapshot = self._snapshot_locked()
+        try:
+            self._write_snapshot(gen, snapshot)
+        except Exception as exc:
+            with self._index_lock:
+                self._index_dirty = True
+            self._flush_wakeup.set()
+            print(f"[image-index] save fail {exc}")
+            return False
+        return True
 
     def _public_url(self, rel: str, base_url: str | None = None) -> str:
         settings = self.settings()
@@ -203,7 +285,11 @@ class ImageStorageService:
         return f"{relative_dir.as_posix()}/{filename}"
 
     def save(self, image_data: bytes, base_url: str | None = None) -> StoredImage:
-        config.cleanup_old_images()
+        global _last_save_cleanup_at
+        now = time.time()
+        if not is_worker() and now - _last_save_cleanup_at >= _SAVE_CLEANUP_INTERVAL_SECS:
+            _last_save_cleanup_at = now
+            config.cleanup_old_images()
         rel = self.make_relative_path(image_data)
         mode = self.mode()
         if mode not in {"local", "webdav", "both"}:
@@ -237,10 +323,13 @@ class ImageStorageService:
         }
         if dimensions:
             item["width"], item["height"] = dimensions
-        with self._index_lock:
-            items = self._load_clean_index()
-            items[rel] = item
-            self._save_index(items)
+        if is_worker():
+            # 图片文件工作进程自己写；索引只在管家进程里维护
+            from services.coordinator import register_remote_image
+
+            register_remote_image(rel, item)
+        else:
+            self.add_index_item(rel, item)
         return StoredImage(rel=rel, url=self._public_url(rel, base_url), storage=str(item["storage"]), size=len(image_data))
 
     def get_bytes(self, rel: str) -> bytes:
@@ -402,4 +491,8 @@ class ImageStorageService:
         return WebDAVClient(self.settings()).test()
 
 
-image_storage_service = ImageStorageService()
+image_storage_service = ImageStorageService(save_interval_secs=config.image_index_save_interval_secs)
+if not is_worker():
+    import atexit
+
+    atexit.register(image_storage_service.flush_index)

@@ -3,7 +3,6 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from threading import Event
 
-from anyio import to_thread
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -12,16 +11,14 @@ from api import accounts, ai, image_tasks, system
 from api.errors import install_exception_handlers
 from api.support import resolve_web_asset, start_limited_account_watcher
 from services.account_service import account_service
+from services.auth_service import auth_service
 from services.backup_service import backup_service
 from services.config import config
 from services.image_service import start_image_cleanup_scheduler
-
-
-def apply_request_thread_pool_size(size: int) -> int:
-    """调整同步接口共用的线程池大小（anyio 默认 40）。必须在事件循环里调用。"""
-    limiter = to_thread.current_default_thread_limiter()
-    limiter.total_tokens = max(1, int(size))
-    return int(limiter.total_tokens)
+from services.image_storage_service import image_storage_service
+from services.log_service import log_service
+from services.process_role import is_coordinator
+from services.thread_pool import apply_request_thread_pool_size
 
 
 def create_app() -> FastAPI:
@@ -31,6 +28,17 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI):
         pool_size = apply_request_thread_pool_size(config.request_thread_pool_size)
         print(f"[startup] request thread pool size = {pool_size}")
+        coordinator_server = None
+        if is_coordinator():
+            from services.coordinator import CoordinatorServer
+
+            coordinator_server = CoordinatorServer(
+                accounts=account_service,
+                logs=log_service,
+                auth=auth_service,
+                images=image_storage_service,
+            )
+            coordinator_server.start()
         stop_event = Event()
         thread = start_limited_account_watcher(stop_event)
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
@@ -43,7 +51,10 @@ def create_app() -> FastAPI:
             thread.join(timeout=1)
             cleanup_thread.join(timeout=1)
             backup_service.stop()
+            if coordinator_server is not None:
+                coordinator_server.stop()
             account_service.flush_pending_save()
+            image_storage_service.flush_index()
 
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)

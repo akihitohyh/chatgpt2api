@@ -13,6 +13,7 @@ from services.config import DATA_DIR
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.openai_backend_api import EDITABLE_FILE_MODEL, OpenAIBackendAPI
+from services.process_role import WorkerUnavailable, is_worker
 from utils.helper import new_uuid
 
 TASK_STATUS_QUEUED = "queued"
@@ -257,4 +258,8 @@ class EditableFileTaskService:
             pass
 
 
-editable_file_task_service = EditableFileTaskService()
+if is_worker():
+    # 构造时会把未完成任务标成失败并写盘，工作进程里绝不能建；这类请求由管家处理
+    editable_file_task_service = WorkerUnavailable("editable_file_task_service")
+else:
+    editable_file_task_service = EditableFileTaskService()
