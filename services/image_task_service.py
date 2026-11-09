@@ -12,6 +12,7 @@ from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
+from services.process_role import WorkerUnavailable, is_worker
 
 TASK_STATUS_QUEUED = "queued"
 TASK_STATUS_RUNNING = "running"
@@ -548,4 +549,7 @@ class ImageTaskService:
                 backend.close()
 
 
-image_task_service = ImageTaskService(DATA_DIR / "image_tasks.json")
+if is_worker():
+    image_task_service = WorkerUnavailable("image_task_service")
+else:
+    image_task_service = ImageTaskService(DATA_DIR / "image_tasks.json")

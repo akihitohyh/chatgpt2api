@@ -42,7 +42,7 @@ RUN pip install --no-cache-dir uv
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
-COPY main.py ./
+COPY main.py serve.py ./
 COPY config.json ./
 COPY VERSION ./
 COPY api ./api
@@ -53,4 +53,5 @@ COPY --from=web-build /app/web/out ./web_dist
 
 EXPOSE 80
 
-CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--access-log"]
+# CHATGPT2API_WORKERS 不设或为 0 时，serve.py 直接执行原来的单进程命令
+CMD ["uv", "run", "python", "serve.py"]

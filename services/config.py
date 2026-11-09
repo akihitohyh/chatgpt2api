@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 import time
 
+from services.process_role import is_worker
 from services.storage.base import StorageBackend
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -348,10 +349,16 @@ def _load_settings() -> LoadedSettings:
 
 
 class ConfigStore:
+    # 工作进程不改配置，但要跟上管家进程在后台页面里改的配置：最多每秒看一次文件有没有变
+    _RELOAD_CHECK_INTERVAL_SECS = 1.0
+
     def __init__(self, path: Path):
         self.path = path
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        self.data = self._load()
+        self._watch_file = is_worker()
+        self._file_mtime_ns = self._stat_mtime_ns()
+        self._reload_checked_at = time.monotonic()
+        self._data: dict[str, object] = self._load()
         self._storage_backend: StorageBackend | None = None
         if _is_invalid_auth_key(self.auth_key):
             raise ValueError(
@@ -366,8 +373,45 @@ class ConfigStore:
     def _load(self) -> dict[str, object]:
         return _read_json_object(self.path, name="config.json")
 
+    def _stat_mtime_ns(self) -> int:
+        try:
+            return self.path.stat().st_mtime_ns
+        except OSError:
+            return 0
+
+    @property
+    def data(self) -> dict[str, object]:
+        if self._watch_file:
+            now = time.monotonic()
+            if now - self._reload_checked_at >= self._RELOAD_CHECK_INTERVAL_SECS:
+                self._reload_checked_at = now
+                mtime = self._stat_mtime_ns()
+                if mtime != self._file_mtime_ns:
+                    loaded = self._load()
+                    # 读到空文件或半截文件时不记修改时间，下一秒再试
+                    if loaded:
+                        self._data = loaded
+                        self._file_mtime_ns = mtime
+        return self._data
+
+    @data.setter
+    def data(self, value: dict[str, object]) -> None:
+        self._data = value
+
     def _save(self) -> None:
-        self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        # 原子写入：工作进程会随时读这个文件，不能让它读到半截
+        content = json.dumps(self.data, ensure_ascii=False, indent=2) + "\n"
+        tmp_path = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        try:
+            tmp_path.write_text(content, encoding="utf-8")
+            try:
+                os.replace(tmp_path, self.path)
+            except OSError:
+                # config.json 在 Docker 里是单文件挂载，不能被替换，只能原地写
+                self.path.write_text(content, encoding="utf-8")
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
 
     @property
     def auth_key(self) -> str:
@@ -435,6 +479,14 @@ class ConfigStore:
         """账号文件合并写入的间隔（秒），0 = 每次改动立即写；改了要重启才生效。"""
         try:
             return min(60.0, max(0.0, float(self.data.get("account_save_interval_secs", 1.0))))
+        except (TypeError, ValueError):
+            return 1.0
+
+    @property
+    def image_index_save_interval_secs(self) -> float:
+        """图片索引合并写入的间隔（秒），0 = 每张图立即写；改了要重启才生效。"""
+        try:
+            return min(60.0, max(0.0, float(self.data.get("image_index_save_interval_secs", 1.0))))
         except (TypeError, ValueError):
             return 1.0
 
@@ -587,6 +639,7 @@ class ConfigStore:
         data["image_parallel_generation"] = self.image_parallel_generation
         data["request_thread_pool_size"] = self.request_thread_pool_size
         data["account_save_interval_secs"] = self.account_save_interval_secs
+        data["image_index_save_interval_secs"] = self.image_index_save_interval_secs
         data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result
         data["image_remove_conversation_always"] = self.image_remove_conversation_always
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
