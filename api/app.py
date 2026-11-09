@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from threading import Event
 
+from anyio import to_thread
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -10,9 +11,17 @@ from fastapi.responses import FileResponse
 from api import accounts, ai, image_tasks, system
 from api.errors import install_exception_handlers
 from api.support import resolve_web_asset, start_limited_account_watcher
+from services.account_service import account_service
 from services.backup_service import backup_service
 from services.config import config
 from services.image_service import start_image_cleanup_scheduler
+
+
+def apply_request_thread_pool_size(size: int) -> int:
+    """调整同步接口共用的线程池大小（anyio 默认 40）。必须在事件循环里调用。"""
+    limiter = to_thread.current_default_thread_limiter()
+    limiter.total_tokens = max(1, int(size))
+    return int(limiter.total_tokens)
 
 
 def create_app() -> FastAPI:
@@ -20,6 +29,8 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
+        pool_size = apply_request_thread_pool_size(config.request_thread_pool_size)
+        print(f"[startup] request thread pool size = {pool_size}")
         stop_event = Event()
         thread = start_limited_account_watcher(stop_event)
         cleanup_thread = start_image_cleanup_scheduler(stop_event)
@@ -32,6 +43,7 @@ def create_app() -> FastAPI:
             thread.join(timeout=1)
             cleanup_thread.join(timeout=1)
             backup_service.stop()
+            account_service.flush_pending_save()
 
     app = FastAPI(title="chatgpt2api", version=app_version, lifespan=lifespan)
     install_exception_handlers(app)

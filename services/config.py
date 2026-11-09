@@ -423,6 +423,22 @@ class ConfigStore:
             return 3
 
     @property
+    def request_thread_pool_size(self) -> int:
+        """同步接口（含生图）共用的线程池大小，决定能同时处理多少个请求；改了要重启才生效。"""
+        try:
+            return min(1000, max(1, int(self.data.get("request_thread_pool_size", 40))))
+        except (TypeError, ValueError):
+            return 40
+
+    @property
+    def account_save_interval_secs(self) -> float:
+        """账号文件合并写入的间隔（秒），0 = 每次改动立即写；改了要重启才生效。"""
+        try:
+            return min(60.0, max(0.0, float(self.data.get("account_save_interval_secs", 1.0))))
+        except (TypeError, ValueError):
+            return 1.0
+
+    @property
     def image_parallel_generation(self) -> bool:
         value = self.data.get("image_parallel_generation", True)
         if isinstance(value, str):
@@ -569,6 +585,8 @@ class ConfigStore:
         data["image_poll_initial_wait_secs"] = self.image_poll_initial_wait_secs
         data["image_account_concurrency"] = self.image_account_concurrency
         data["image_parallel_generation"] = self.image_parallel_generation
+        data["request_thread_pool_size"] = self.request_thread_pool_size
+        data["account_save_interval_secs"] = self.account_save_interval_secs
         data["image_remove_conversation_after_result"] = self.image_remove_conversation_after_result
         data["image_remove_conversation_always"] = self.image_remove_conversation_always
         data["auto_remove_invalid_accounts"] = self.auto_remove_invalid_accounts
