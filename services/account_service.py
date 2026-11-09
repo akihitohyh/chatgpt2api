@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import base64
 import json
 import secrets
@@ -8,7 +9,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Condition, Lock, Thread
+from threading import Condition, Event, Lock, Thread
 from typing import Any
 from urllib.parse import urlencode
 
@@ -46,9 +47,15 @@ class AccountService:
     _relogin_progress: dict[str, dict] = {}
     _relogin_progress_lock = Lock()
 
-    def __init__(self, storage_backend: StorageBackend):
+    def __init__(self, storage_backend: StorageBackend, save_interval_secs: float = 0.0):
         self.storage = storage_backend
         self._lock = Lock()
+        # 账号落盘合并：>0 时改动先记脏，后台线程每隔这么多秒最多整份写一次；0 = 每次改动立即写（旧行为）
+        self._save_interval_secs = max(0.0, float(save_interval_secs or 0.0))
+        self._save_pending = False
+        self._save_io_lock = Lock()
+        self._save_wakeup = Event()
+        self._save_worker: Thread | None = None
         self._token_refresh_lock = Lock()
         self._image_slot_condition = Condition(self._lock)
         self._index = 0
@@ -128,7 +135,42 @@ class AccountService:
         }
 
     def _save_accounts(self) -> None:
-        self.storage.save_accounts(list(self._accounts.values()))
+        """调用方必须已持有 self._lock。"""
+        if self._save_interval_secs <= 0:
+            self.storage.save_accounts(list(self._accounts.values()))
+            return
+        self._save_pending = True
+        if self._save_worker is None:
+            self._save_worker = Thread(target=self._save_worker_loop, name="account-save", daemon=True)
+            self._save_worker.start()
+        self._save_wakeup.set()
+
+    def _save_worker_loop(self) -> None:
+        while True:
+            self._save_wakeup.wait()
+            # 先等一个间隔，把这段时间里的改动合并成一次写入
+            time.sleep(self._save_interval_secs)
+            self._save_wakeup.clear()
+            self.flush_pending_save()
+
+    def flush_pending_save(self) -> bool:
+        """把还没落盘的账号改动立即写出去；没有待写内容时返回 False。"""
+        with self._save_io_lock:
+            with self._lock:
+                if not self._save_pending:
+                    return False
+                self._save_pending = False
+                # 浅拷贝即可：账号里的嵌套字段只会被整体替换，不会原地修改
+                snapshot = [dict(account) for account in self._accounts.values()]
+            try:
+                self.storage.save_accounts(snapshot)
+            except Exception as exc:
+                with self._lock:
+                    self._save_pending = True
+                self._save_wakeup.set()
+                print(f"[account-save] fail {exc}")
+                return False
+            return True
 
     @staticmethod
     def _is_image_account_available(account: dict) -> bool:
@@ -1749,4 +1791,8 @@ class AccountService:
         }
 
 
-account_service = AccountService(config.get_storage_backend())
+account_service = AccountService(
+    config.get_storage_backend(),
+    save_interval_secs=config.account_save_interval_secs,
+)
+atexit.register(account_service.flush_pending_save)

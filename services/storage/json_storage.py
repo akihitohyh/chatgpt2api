@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,17 +27,32 @@ class JSONStorageBackend(StorageBackend):
             return []
         try:
             data = json.loads(file_path.read_text(encoding="utf-8"))
-            return data if isinstance(data, list) else []
-        except (json.JSONDecodeError, Exception):
+        except Exception as exc:
+            # 文件坏了不能悄悄当成空列表：先另存一份，免得下一次保存把它覆盖掉
+            backup = file_path.with_name(f"{file_path.name}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}")
+            try:
+                shutil.copy2(file_path, backup)
+                print(f"[json-storage] {file_path} 无法解析（{exc}），原文件已另存为 {backup}", file=sys.stderr)
+            except Exception as copy_exc:
+                print(f"[json-storage] {file_path} 无法解析（{exc}），另存失败：{copy_exc}", file=sys.stderr)
             return []
+        return data if isinstance(data, list) else []
 
     @staticmethod
     def _save_json_list(file_path: Path, items: list[dict[str, Any]]) -> None:
+        """原子写入：先写同目录临时文件，写完再整体替换，读的人永远看不到半截文件。"""
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(
-            json.dumps(items, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        content = json.dumps(items, ensure_ascii=False, indent=2) + "\n"
+        tmp_path = file_path.with_name(f".{file_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            with tmp_path.open("w", encoding="utf-8") as file:
+                file.write(content)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(tmp_path, file_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
 
     def load_accounts(self) -> list[dict[str, Any]]:
         """从 JSON 文件加载账号数据"""
